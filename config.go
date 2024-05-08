@@ -1,9 +1,8 @@
-package client
+package walletclient
 
 import (
 	"path/filepath"
 	"github.com/btcsuite/btcd/btcutil"
-	"github.com/nsandomeno/btcwallet-client"
 )
 
 var (
@@ -15,6 +14,16 @@ var (
 	SERVER_URI      = "127.0.0.1:5000"
 	FALLBACK_HOST   = "127.0.0.1"
 )
+
+// config struct
+type Config struct {
+	Directory        string
+	ServerRpcCert    string
+	ServerUri        string
+	PublicPassphrase []byte
+	RpcUser		     string
+	RpcPass		     string
+}
 
 func NewConfig(dir string, serverRpcCert string, serverUri string) Config {
 	// load the rpc certification
