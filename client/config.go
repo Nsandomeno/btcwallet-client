@@ -3,7 +3,7 @@ package client
 import (
 	"path/filepath"
 	"github.com/btcsuite/btcd/btcutil"
-	"btcwallet-client/client/config"
+	"github.com/nsandomeno/btcwallet-client"
 )
 
 var (

@@ -1,4 +1,4 @@
-module btcwallet-client
+module github.com/nsandomeno/btcwallet-client
 
 go 1.21.3
 
