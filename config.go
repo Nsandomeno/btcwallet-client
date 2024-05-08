@@ -5,7 +5,7 @@ import (
 	"github.com/btcsuite/btcd/btcutil"
 )
 
-var (
+const (
 	BASE_DIR        = "~/Library/Application Support/"
 	DIR             = "btcwalletclient"
 	SERVER_RPC_CERT = "rpc.cert"
@@ -25,7 +25,7 @@ type Config struct {
 	RpcPass		     string
 }
 
-func NewConfig(dir string, serverRpcCert string, serverUri string) Config {
+func NewConfig(dir string, serverRpcCert string, serverUri string) *Config {
 	// load the rpc certification
 	walletCertDir := btcutil.AppDataDir(dir, false)
 	// tls cert full path
@@ -33,12 +33,12 @@ func NewConfig(dir string, serverRpcCert string, serverUri string) Config {
 	// load passphrase bytes
 	passphrase := []byte("")
 	// return config instance
-	return Config{
-		Directory:  walletCertDir,
-		ServerRpcCert: certFileName,
-		ServerUri: serverUri,
+	return &Config{
+		Directory:        walletCertDir,
+		ServerRpcCert:    certFileName,
+		ServerUri:        serverUri,
 		PublicPassphrase: passphrase,
-		RpcUser: RPCUSER,
-		RpcPass: RPCPASS,
+		RpcUser:         RPCUSER,
+		RpcPass:         RPCPASS,
 	}
 }
