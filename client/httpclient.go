@@ -1,5 +1,4 @@
 package client
-
 // * THANKS TO THE AUTHORS OF BTCSUITE - SPECIFIC INSPIRATION FOR THIS FILE FROM btcd/rpcclient
 // * ISC LICENSE AT ROOT OF THIS REPOSTIORY
 import (
@@ -393,3 +392,7 @@ type Client struct {
 	shutdown        chan struct{}
 	wg              sync.WaitGroup
 }
+
+// New creates RPC client based on the config
+// nofification handlers param can be nil if you don't want to handle notifications
+// 
