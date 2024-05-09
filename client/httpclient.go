@@ -395,4 +395,84 @@ type Client struct {
 
 // New creates RPC client based on the config
 // nofification handlers param can be nil if you don't want to handle notifications
-// 
+// or, running in HTTP POST mode (only?)
+func New(config *wallet.Config, ntfnHandlers *NotificationHandlers) (*Client, error) {
+	// either open websocket connection or create an HTTP client depending on the HTTP Post mode.
+	// also, set notification handlers to nil if running in HTTP POST mode
+	var wsConn      *websocket.Conn
+	var httpClient  *http.Client
+	connEstablished := make(chan struct{})
+	var start       bool
+	// check if HTTP Post mode is enabled
+	if config.HTTPPostMode {
+		ntfnHandlers = nil 
+		// start flag setter
+		start = true
+		var err error
+		// create http client
+		httpClient, err = newHTTPClient(config)
+		if err != nil {
+			// TODO handle error
+			return nil, err
+		}
+	} else {
+		if !config.DisableConnectOnNew {
+			var err error
+			// create websocket connection
+			wsConn, err = dial(config)
+			if err != nil {
+				// TODO handle error
+				return nil, err
+			}
+			// start flag setter
+			start = true
+		}
+	}
+	// create new client
+	client := &Client{
+		config:         config,
+		wsConn: 	    wsConn,
+		httpClient:     httpClient,
+		requestMap:     make(map[uint64]*list.Element),
+		requestList:    list.New(),
+		batch: 		    false,
+		batchList: 	    list.New(),
+		ntfnHandlers:   ntfnHandlers,
+		ntfnState:      newNotificationState(),
+		sendChan:       make(chan []byte, sendBufferSize),
+		sendPostChan:   make(chan *jsonRequest, sendPostBufferSize),
+		connEstablished: connEstablished,
+		disconnect:     make(chan struct{}),
+		shutdown:       make(chan struct{}),
+	}
+	// default network is mainnet
+	switch config.Params {
+		case "":
+			fallthrough
+		case chaincfg.MainNetParams.Name:
+			client.chainParams = &chaincfg.MainNetParams
+		case chaincfg.TestNet3Params.Name:
+			client.chainParams = &chaincfg.TestNet3Params
+		case chaincfg.RegressionNetParams.Name:
+			client.chainParams = &chaincfg.RegressionNetParams
+		case chaincfg.SimNetParams.Name:
+			client.chainParams = &chaincfg.SimNetParams
+		default:
+			return nil, fmt.Errorf("rpcclient.New: Unknown chain %s", config.Params)		
+	}
+	// attempt to start the client
+	if start {
+		log.Infof("Established connection to RPC server %s", config.ServerUri)
+		close(connEstablished)
+
+		// TODO implement start and fix the line below
+		client.start()
+		if !client.config.HTTPPostMode && !client.config.DisableAutoReconnect {
+			client.wg.Add(1)
+			// TODO implement wsReconnectHandler and fix the line below
+			go client.wsReconnectHandler()
+		}
+	}
+	// return the client
+	return client, nil
+}
