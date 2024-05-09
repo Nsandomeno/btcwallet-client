@@ -476,3 +476,28 @@ func New(config *wallet.Config, ntfnHandlers *NotificationHandlers) (*Client, er
 	// return the client
 	return client, nil
 }
+
+// Batch is a factory that creates a client communicating with the BtcWallet Server of JSON-RPC 2.0.
+// This enables the client to accept an arbitrary number of requests and have the server process them all at the same tiem.
+
+// NOTE: this is compatible with both btcd and bitcoind
+func NewBatch(config *wallet.Config) (*Client, error) {
+	// check for HTTP Post Mode
+	if !config.HTTPPostMode {
+		// TODO handle errors
+		return nil, errors.New("http post mode is required for the batch client")
+	}
+	// notifications are turned off since they are not supported over HTTP Post Mode
+	client, err := New(config, nil)
+	if err != nil {
+		// TODO handle error
+		return nil, err
+	}
+	client.batch = true // copy the client with a modified batch setting
+	// start the client
+
+	// TODO implement start and fix the line below
+	client.start()
+
+	return client, nil
+}
