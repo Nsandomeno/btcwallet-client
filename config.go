@@ -23,6 +23,19 @@ type Config struct {
 	PublicPassphrase []byte
 	RpcUser		     string
 	RpcPass		     string
+	WsEndpoint       string
+	// params refers to the bitcoin network i.e. testnet, mainnet, etc.
+	Params           string
+	DisableTLS       bool
+	// bytes for pem encoded cert chain used for the tls connection. No effect if the DisableTLS param is true.
+	Certificates     []byte
+	// DisableAutoReconnect specifies the client should not automatically reconnect to the server if the connection is lost.
+	DisableAutoReconnect bool
+	// DisableConnectOnNew specifies the client should not automatically connect to the server when a new client is created.
+	DisableConnectOnNew bool
+	// HTTPPostMode instructs the client to run using multiple independent connections issuing HTTP POST requests instead of using the default
+	// of websockets.
+	HTTPPostMode bool 
 }
 
 func NewConfig(dir string, serverRpcCert string, serverUri string) *Config {
@@ -30,6 +43,9 @@ func NewConfig(dir string, serverRpcCert string, serverUri string) *Config {
 	walletCertDir := btcutil.AppDataDir(dir, false)
 	// tls cert full path
 	certFileName := filepath.Join(walletCertDir, serverRpcCert)
+	// TODO read and add certificates here: see the httpclient for reference
+
+	// 
 	// load passphrase bytes
 	passphrase := []byte("")
 	// return config instance
@@ -40,5 +56,17 @@ func NewConfig(dir string, serverRpcCert string, serverUri string) *Config {
 		PublicPassphrase: passphrase,
 		RpcUser:         RPCUSER,
 		RpcPass:         RPCPASS,
+		WsEndpoint:      "ws",
+		Params:          "testnet",
+		DisableTLS:      false,
+		Certificates:    nil,
+		DisableAutoReconnect: false,
+		DisableConnectOnNew: false,
+		HTTPPostMode: false,
 	}
+}
+// return values that are required for JSON-RPC Authentication
+func (config *Config) GetAuth() (username string, passphrase string, err error) {
+	// TODO cookie auth not yet implemented, these are required
+	return config.RpcUser, config.RpcPass, nil
 }
