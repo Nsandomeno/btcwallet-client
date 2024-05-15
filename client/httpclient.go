@@ -16,6 +16,7 @@ import (
 	"net"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/btcsuite/btcd/btcjson"
@@ -533,6 +534,14 @@ func (c *Client) start() {
 	}
 }
 
+// NextID returns the next ID to be used when sending a JSON-RPC message.
+
+// NOTE allow this is normally not needed by a consumer of this client application,
+// if a custom request is being created and used this function should be used to ensure the ID is unique.
+func (c *Client) NextID() uint64 {
+	return atomic.AddUint64(&c.id, 1)
+}
+
 // handleMessage is the main handler for incoming notifications and responses
 func (c *Client) handleMessage(msg []byte) {
 	// attempt to unmarshal the message as either a notification or a response
@@ -878,6 +887,34 @@ func (c *Client) shouldLogReadError(err error) bool {
 
 	return true
 }
+// addRequest associates the passed jsonRequest with its ID. This allows the response from the remote server to
+// be unmarshalled to the appropriate type and sent to the specified channel when it is received.
+
+// NOTE if the client has already begun shutting down, ErrClientShutdown is returned and the request is not added.
+// NOTE this function is safe for concurrent access.
+func (c *Client) addRequest(jReq *jsonRequest) error {
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+
+	// a non-blocking read of the shutdown channel with the request lock held avoids adding the request
+	// to the client's internal data structures if the client is in the process of shutting down.
+	select {
+	case <- c.shutdown:
+		return ErrClientShutdown
+	default:
+	}
+
+	if !c.batch {
+		element := c.requestList.PushBack(jReq)
+		c.requestMap[jReq.id] = element
+	} else {
+		element := c.batchList.PushBack(jReq)
+		c.requestMap[jReq.id] = element
+	
+	}
+	// success
+	return nil
+}
 
 // removeAllRequests removes all the jsonRequests which contain the response channels for outstanding requests.
 
@@ -993,4 +1030,90 @@ func (c *Client) reregisterNtfns() error {
 	}
 
 	return nil
+}
+
+// SendCmd sends the passed command to the associated server and returns
+// a response channel on which the reply will be delivered at some point in the future.
+
+// NOTE It handles both websocket and HTTP POST mode depending on the configuration of the client.
+func (c *Client) SendCmd(cmd interface{}) chan *Response {
+	rpcVersion := btcjson.RpcVersion1
+	if c.batch {
+		rpcVersion = btcjson.RpcVersion2
+	}
+	// get the method associated with the command
+	method, err := btcjson.CmdMethod(cmd)
+	if err != nil {
+		return newFutureError(err)
+	}
+	// marshal the command
+	id := c.NextID()
+	marshalledJSON, err := btcjson.MarshalCmd(rpcVersion, id, cmd)
+	if err != nil {
+		return newFutureError(err)
+	}
+	// generate the request and send it along with a channel to respond on
+	responseChan := make(chan *Response, 1)
+	jReq := &jsonRequest{
+		id: id,
+		method: method,
+		cmd: cmd,
+		marshalledJSON: marshalledJSON,
+		responseChan: responseChan,
+	}
+
+	c.sendRequest(jReq)
+	return responseChan
+}
+
+// sendRequest sends the passed json request to the associated server using the response channel for the reply.
+// NOTE it handles both websocket and HTTP POST mode depending on the configuration of the client.
+func (c *Client) sendRequest(jReq *jsonRequest) {
+	// chose which marshal and send function to use depending on whether the client running in HTTP POST mode or not.
+	// when running in HTTP POST mode, the request the command is issued via an HTTP client. Otherwise, the command
+	// is issued via the asynchronous websocket channel
+	if c.config.HTTPPostMode {
+		if c.batch {
+			if err := c.addRequest(jReq); err != nil {
+				log.Warn(err)
+			}
+		} else {
+			c.sendPostRequest(jReq)
+		}
+		return
+	}
+	// check whether the websocket connection has never been established,
+	// in which case the handler goroutines are not running.
+	select {
+	case <-c.connEstablished:
+	default:
+		jReq.responseChan <- &Response{result: nil, err: ErrClientNotConnected}
+		return
+	}
+	// add the request to the internal tracking map so the response from the remote server can be properly detected and routed to the
+	// response channel. Then, send the marshalled request via the websocket connection
+	if err := c.addRequest(jReq); err != nil {
+		jReq.responseChan <- &Response{err: err}
+		return
+	}
+	log.Tracef("Sending command [%s] with id %d", jReq.method, jReq.id)
+	c.sendMessage(jReq.marshalledJSON)
+}
+
+// sendPostRequest sends the passed HTTP request to the RPC server using the HTTP client. it is backed by a buffered channel,
+// so it will not block until the send channel is full
+func (c *Client) sendPostRequest(jReq *jsonRequest) {
+	// dont send the message if shutting down
+	select {
+	case <-c.shutdown:
+		jReq.responseChan <- &Response{result: nil, err: ErrClientShutdown}
+	default:
+	}
+
+	select {
+	case c.sendPostChan <- jReq:
+		log.Tracef("Sending command [%s] with id %d", jReq.method, jReq.id)
+	case <-c.shutdown:
+		return
+	}
 }
