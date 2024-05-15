@@ -25,12 +25,12 @@ func main() {
 
 	// Connect to local btcwallet RPC server using websockets.
 	certHomeDir := btcutil.AppDataDir("btcwalletclient", false)
-	certs, err := os.ReadFile(filepath.Join(certHomeDir, "btcd.cert"))
+	certs, err := os.ReadFile(filepath.Join(certHomeDir, "rpc.cert"))
 	if err != nil {
 		log.Fatal(err)
 	}
 	connCfg := &rpcclient.ConnConfig{
-		Host:         "localhost:18334",
+		Host:         "localhost:18332",
 		Endpoint:     "ws",
 		User:         "na-dev",
 		Pass:         "password123",
@@ -51,7 +51,6 @@ func main() {
 	if len(unspent) > 0 {
 		log.Printf("First utxo:\n%v", spew.Sdump(unspent[0]))
 	}
-
 	// For this example gracefully shutdown the client after 10 seconds.
 	// Ordinarily when to shutdown the client is highly application
 	// specific.
