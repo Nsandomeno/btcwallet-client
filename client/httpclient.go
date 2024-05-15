@@ -1,4 +1,5 @@
 package client
+
 // * THANKS TO THE AUTHORS OF BTCSUITE - SPECIFIC INSPIRATION FOR THIS FILE FROM btcd/rpcclient
 // * ISC LICENSE AT ROOT OF THIS REPOSTIORY
 import (
@@ -11,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -500,4 +503,494 @@ func NewBatch(config *wallet.Config) (*Client, error) {
 	client.start()
 
 	return client, nil
+}
+
+// begin processing io
+func (c *Client) start() {
+	log.Tracef("Starting RPC client %s", c.config.ServerUri)
+	// being processing handlers depending on the configured mode (HTTP Post or Websocket)
+	if c.config.HTTPPostMode {
+		c.wg.Add(1)
+
+		// TODO implement sendPostHandler
+		//go c.sendPostHandler()
+	} else {
+		c.wg.Add(3)
+		// notification handler
+		go func() {
+			if c.ntfnHandlers != nil {
+				if c.ntfnHandlers.OnClientConnected != nil {
+					c.ntfnHandlers.OnClientConnected()
+				}
+			}
+			c.wg.Done()
+		}()
+		// websocket io handlers
+
+		// TODO implement websocket IO handlers
+		go c.wsInHandler()
+		go c.wsOutHandler()
+	}
+}
+
+// handleMessage is the main handler for incoming notifications and responses
+func (c *Client) handleMessage(msg []byte) {
+	// attempt to unmarshal the message as either a notification or a response
+	var in inMessage
+	in.rawResponse = new(rawResponse)
+	in.rawNotification = new(rawNotification)
+	err := json.Unmarshal(msg, &in)
+
+	if err != nil {
+		log.Errorf("Remote server sent invalid message: %v", err)
+		return
+	}
+
+	// JSON-RPC 1.0 notifications are requests with no ID
+	if in.ID == nil {
+		ntfn := in.rawNotification
+		if ntfn == nil {
+			log.Errorf("Malformed notification: missing method and parameters")
+			return
+		}
+		if ntfn.Method == "" {
+			log.Errorf("Malformed notification: missing method")
+			return
+		}
+		// params are not optional: nil isn't valid (but len == 0 is)
+		if ntfn.Params == nil {
+			log.Warn("Malformed notification: missing parameters")
+			return
+		}
+		// deliver the notification
+		log.Tracef("Received notification [%s]", in.Method)
+		c.handleNotification(in.rawNotification)
+
+		return
+	}
+	// ensure that in.ID can be converted to an integer without loss of precision
+	if *in.ID < 0 || *in.ID != math.Trunc(*in.ID) {
+		log.Warn("Malformed response: invalid identifier")
+		return 
+	}
+
+	if in.rawResponse == nil {
+		log.Warn("Malformed response: missing result and error")
+		return
+	}
+
+	id := uint64(*in.ID)
+	log.Tracef("Received response for id %d (result %s)", id, in.Result)
+	request := c.removeRequest(id)
+	// nothing more to do if there is no request associated with this reply
+	if request == nil || request.responseChan == nil {
+		log.Warnf("Received unexpected reply for id %d", id)
+		return
+	}
+	// since the command was successful, examine it to see if its a notification
+	// and if it is, add it to the notification state so it can automatically be re-established on reconnect.
+	c.trackRegisteredNtfns(request.cmd)
+	// deliver response
+	result, err := in.rawResponse.result()
+	request.responseChan <- &Response{result: result, err: err}
+}
+
+// sendMessage sends the passed JSON to the connected server using the websocket connection. It is backed by a buffered channel
+// so it will not block until the send channel is full.
+func (c *Client) sendMessage(marshalledJSON []byte) {
+	// noop if disconnected
+	select {
+	case c.sendChan <- marshalledJSON:
+	case <- c.disconnectChan():
+		return
+	}
+}
+// Disconnect disconnects the current websocket associated with the client. The connection will automatically be re-established
+// unless the client was created with the DisableAutoReconnect option.
+
+// NOTE this function has no effect when the client is running in HTTP POST mode.
+func (c *Client) Disconnect() {
+	// noop if already disconnected
+	if !c.doDisconnect() {
+		return
+	}
+
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+	// when operating without auto reconnect, send errors to any pending requests and shutdown the client
+	if c.config.DisableAutoReconnect {
+		for e := c.requestList.Front(); e != nil; e = e.Next() {
+			req := e.Value.(*jsonRequest)
+			req.responseChan <- &Response{ result: nil, err: ErrClientDisconnect }
+		}
+		c.removeAllRequests()
+		c.doShutdown()
+	}
+}
+
+// Disconnected returns whether or not the client is currently disconnected. If
+// a websocket client was created but never connected, this also returns false.
+func (c *Client) Disconnected() bool {
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	
+	select {
+	case <-c.connEstablished:
+		return c.disconnected
+	default:
+		return true
+	}
+}
+
+// doDisconnect disconnects the associated websocket with the client if it hasn't already been disconnected. 
+// It will return false if the disconnect is not needed or the client is running in HTTP POST Mode.
+
+// NOTE this is safe for concurrent access
+func (c *Client) doDisconnect() bool {
+	if c.config.HTTPPostMode {
+		return false
+	}
+
+	c.mtx.Lock()
+	defer c.mtx.Unlock()
+	// noop if already disconnected
+	if c.disconnected {
+		return false
+	}
+	log.Tracef("Disconnecting RPC client %s", c.config.ServerUri)
+	close(c.disconnect)
+
+	if c.wsConn != nil {
+		c.wsConn.Close()
+	}
+	c.disconnected = true
+	return true
+}
+
+// doShutdown closes the shutdown channel and logs the shutdown unless shutdown is already in progress.
+// It will return false if the shutdown is not needed.
+
+// NOTE this is safe for concurrent access
+func (c *Client) doShutdown() bool {
+	// ignore the shutdown if the client is already in the process of doing so
+	select {
+		case <-c.shutdown:
+			return false
+		default:
+	}
+	log.Tracef("Shutting down RPC client %s", c.config.ServerUri)
+
+	close(c.shutdown)
+	return true
+}
+
+// disconnectChan returns a copy of the current disconnect channel. The channel is read protected by the client mutex, and it is safe to call while the channel is being reassigned during a reconnect.
+func (c *Client) disconnectChan() <-chan struct{} {
+	c.mtx.Lock()
+	ch := c.disconnect
+	c.mtx.Unlock()
+
+	return ch
+}
+
+// resendRequests resends any requests that had not completed when the client disconnected. It is intended to be called 
+// once the client has reconnected as a separate goroutine.
+func (c *Client) resendRequests() {
+	// set the notification state back up. If anything goes wrong, 
+	// disconnect the client.
+	if err := c.reregisterNtfns(); err != nil {
+		log.Warnf("Failed to re-register notifications: %v", err)
+		c.Disconnect()
+		return
+	}
+	// since its possible to block on send and more requests might be added by the caller,
+	// make a copy of all the requests that need to be resent now and work off the copy. This also
+	// allows the lock to be released quickly.
+	c.requestLock.Lock()
+	resendReqs := make([]*jsonRequest, 0, c.requestList.Len())
+	var nextElem *list.Element
+	for e := c.requestList.Front(); e != nil; e = nextElem {
+		nextElem = e.Next()
+
+		jReq := e.Value.(*jsonRequest)
+		if _, ok := ignoreResends[jReq.method]; !ok {
+			// if a request is not sent on reconnect, remove it from the request structures, since 
+			// no reply is expected.
+			delete(c.requestMap, jReq.id)
+			c.requestList.Remove(e)
+		} else {
+			resendReqs = append(resendReqs, jReq)
+		}
+	}
+	c.requestLock.Unlock()
+
+	for _, jReq := range resendReqs {
+		// stop resending commands if the client disconnects again
+		// since the next reconnect will handle them
+		if c.Disconnected() {
+			return
+		}
+		log.Tracef("Resending command %s with id %d", jReq.method, jReq.id)
+		// send message
+		c.sendMessage(jReq.marshalledJSON)
+	}
+}
+
+// wsReconnectHandler listens for clients disconnects and automatically tries to reconnect with retry interval that scales
+// based on the number of retries. It also resends commands that had not completed when the client disconnected so the disconnect/reconnect
+// process is transparent to the caller.
+
+// NOTE this is not run whe nthe DisableAutoReconnect config option is set.
+// NOTE this must be run as a goroutine
+func (c *Client) wsReconnectHandler() {
+out:
+	for {
+		select {
+		case <-c.disconnect:
+			// on disconnect, fallthrough  to reestablish the connection.
+		case <- c.shutdown:
+			break out
+		}
+	reconnect:
+		for {
+			select {
+				case <-c.shutdown:
+					break out
+				default:
+				}
+			// dial websocket connection
+			wsConn, err := dial(c.config)
+			if err != nil {
+				c.retryCount++
+				log.Infof("Failed to connect to %s: %v", c.config.ServerUri, err)
+				// scale the retry interval by the number of retries so there is a backoff up to a max of 1 minute.
+				scaledInterval := connectionRetryInterval.Nanoseconds() * c.retryCount
+				scaledDuration := time.Duration(scaledInterval)
+				if scaledDuration > time.Minute {
+					scaledDuration = time.Minute
+				}
+				log.Infof("Retrying connection to %s in "+
+					"%s", c.config.ServerUri, scaledDuration)
+				time.Sleep(scaledDuration)
+				continue reconnect				
+			}
+			log.Infof("Reestablished connection to the RPC server %s", c.config.ServerUri)
+			// reset the version in case the backend was disconnected due to an upgrade
+			c.nodeVersionMu.Lock()
+			c.nodeVersion = nil
+			c.nodeVersionMu.Unlock()
+			// reset the connection state and signal the reconnect has happened.
+			c.mtx.Lock()
+			c.wsConn = wsConn
+			c.retryCount = 0
+
+			c.disconnect = make(chan struct{})
+			c.disconnected = false
+			c.mtx.Unlock()
+			// start the new processing input and output for the new connection
+			c.start()
+			// reissue pending requests in another goroutine since the send can block
+			go c.resendRequests()
+			// break out of the reconnect loop back to wait for disconnect again
+			break reconnect
+		}
+	}
+	c.wg.Done()
+	log.Tracef("RPC client %s reconnect handler done", c.config.ServerUri)
+}
+
+// wsInHandler handles all incoming messages for the websocket connection associated with the client.
+// NOTE this must be run as a goroutine
+func (c *Client) wsInHandler() {
+out:
+	for {
+		// break out of the loop once the shutdown channel has been closed.
+		// Use a non-blocking select here so we fall through otherwise.
+		select {
+		case <-c.shutdown:
+			break out
+		default:
+		}
+		// read the message
+		_, msg, err := c.wsConn.ReadMessage()
+		if err != nil {
+			// log the error if its not due to disconnection
+			if c.shouldLogReadError(err) {
+				log.Errorf("Websocket receive error from %s: %v", c.config.ServerUri, err)
+			}
+			break out
+		}
+		// handle the message
+		c.handleMessage(msg)
+	}
+	// ensure the connection is closed
+	c.Disconnect()
+	c.wg.Done()
+	log.Tracef("RPC client %s websocket input handler done", c.config.ServerUri)
+}
+
+// wsOutHandler handles all outgoing messages for the websocket connection. It uses a buffered channel to serialize
+// output messages while allowing the sender to continue running asynchronously. 
+// NOTE this must be run as a goroutine
+func (c *Client) wsOutHandler() {
+out:
+	for {
+		// send any messages ready for send until the client is disconnected or closed.
+		select {
+		case msg := <-c.sendChan:
+			err := c.wsConn.WriteMessage(websocket.TextMessage, msg)
+			if err != nil {
+				c.Disconnect()
+				break out
+			}
+		case <- c.disconnectChan():
+			break out
+		}
+	}
+	// drain any channels before exiting so nothing is left waiting around to send
+cleanup:
+	for {
+		select {
+		case <- c.sendChan:
+		default:
+			break cleanup
+		}
+	}
+	c.wg.Done()
+	log.Tracef("RPC client %s websocket output handler done", c.config.ServerUri)
+}
+
+// shouldLogReadError returns whether or not the passed error from the websocket should be logged. This is used to prevent spamming the logs in the case of a disconnect.
+func (c *Client) shouldLogReadError(err error) bool {
+	// no logging when the connection is being forcibly disconnected
+	select {
+	case <- c.shutdown:
+		return false
+	default:
+	}
+	// no logging when the connection has been disconnected
+	if err == io.EOF {
+		return false
+	}
+	if opErr, ok := err.(*net.OpError); ok && !opErr.Temporary() {
+		return false
+	}
+
+	return true
+}
+
+// removeAllRequests removes all the jsonRequests which contain the response channels for outstanding requests.
+
+// NOTE this must be called with the request lock held.
+func (c *Client) removeAllRequests() {
+	c.requestMap = make(map[uint64]*list.Element)
+	c.requestList.Init()
+}
+
+// removeRequest returns and removes the jsonRequest which contains the response channel and original method associated
+// with the passed ID or nil if there is no association.
+
+// NOTE this function is safe for concurrent access.
+func (c *Client) removeRequest(id uint64) *jsonRequest {
+	c.requestLock.Lock()
+	defer c.requestLock.Unlock()
+
+	elem, ok := c.requestMap[id]
+	if !ok {
+		return nil
+	}
+	delete(c.requestMap, id)
+
+	var request *jsonRequest
+	if c.batch {
+		request = c.batchList.Remove(elem).(*jsonRequest)
+	} else {
+		request = c.requestList.Remove(elem).(*jsonRequest)
+	}
+
+	return request
+}
+// trackRegisteredNtfns examines the passed command to see if it is one of the notification commands and updates the 
+// notification state that is used to automatically re-establish registered notifications on reconnect.
+func (c *Client) trackRegisteredNtfns(cmd interface{}) {
+	// noop if the caller is not interested in ntfns
+	if c.ntfnHandlers == nil {
+		return
+	}
+
+	c.ntfnStateLock.Lock()
+	defer c.ntfnStateLock.Unlock()
+
+	switch bcmd := cmd.(type) {
+	case *btcjson.NotifyBlocksCmd:
+		c.ntfnState.notifyBlocks = true
+	
+	case *btcjson.NotifyNewTransactionsCmd:
+		if bcmd.Verbose != nil && *bcmd.Verbose {
+			c.ntfnState.notifyNewTxVerbose = true
+		} else {
+			c.ntfnState.notifyNewTx = true
+		}
+
+	case *btcjson.NotifySpentCmd:
+		for _, op := range bcmd.OutPoints {
+			c.ntfnState.notifySpent[op] = struct{}{}
+		}
+	
+	case btcjson.NotifyReceivedCmd:
+		for _, addr := range bcmd.Addresses {
+			c.ntfnState.notifyReceived[addr] = struct{}{}
+		}
+	}
+}
+
+// reregisterNtfns creates and sends commands needed to re-establish the current notification state associated with the client.
+// It should only be called after the reconnect by the resendRequests function
+func (c *Client) reregisterNtfns() error {
+	// noop if the caller is not interested in ntfns
+	if c.ntfnHandlers == nil {
+		return nil
+	}
+	// in order to avoid holding the lock on the ntfn state for the entire time of the potentially long runnning RPCs issued below,
+	// make a copy of the current state and release the lock.
+
+	// also, other commands will be running concurrently which could modify the notification state (while not under the lock)
+	// which also registers it with the remote RPC server, so this prevents double registrations
+	c.ntfnStateLock.Lock()
+	stateCopy := c.ntfnState.Copy()
+	c.ntfnStateLock.Unlock()
+
+	// re-register notifyblocks if needed
+	if stateCopy.notifyBlocks {
+		log.Debugf("Re-register [notifyblocks]")
+		if err := c.NotifyBlocks(); err != nil {
+			return err
+		}
+	}
+
+	// re-register notifynewtransactions if needed
+	if stateCopy.notifyNewTx || stateCopy.notifyNewTxVerbose {
+		log.Debugf("Re-register [notifynewtransactions] (verbos=%v)", stateCopy.notifyNewTxVerbose)
+
+		err := c.NotifyNewTransactions(stateCopy.notifyNewTxVerbose)
+		if err != nil {
+			return err
+		}
+	}
+
+	// re-register the combination of all prev registered notifyreceived addresses in one command, if needed
+	nrlen := len(stateCopy.notifyReceived)
+	if nrlen > 0 {
+		addresses := make([]string, 0, nrlen)
+		for addr := range stateCopy.notifyReceived {
+			addresses = append(addresses, addr)
+		}
+
+		log.Debugf("Re-register [notifyreceived] %v", addresses)
+		if err := c.notifyReceivedInternal(addresses).Receive(); err != nil {
+			return err
+		}
+	}
+
+	return nil
 }
